@@ -6,7 +6,7 @@
 
 namespace duckdb {
 
-enum class OAuth2GrantType : uint8_t { CLIENT_CREDENTIALS, REFRESH_TOKEN };
+enum class OAuth2GrantType : uint8_t { CLIENT_CREDENTIALS, REFRESH_TOKEN, DEVICE_CODE };
 
 struct OAuth2Credentials {
 	explicit OAuth2Credentials(OAuth2GrantType grant_type) : grant_type(grant_type) {
@@ -36,19 +36,36 @@ struct ClientCredentials : public OAuth2Credentials {
 	}
 
 	const string client_id;
+	//! Empty for a public client
 	const string client_secret;
+};
+
+//! Device authorization grant (RFC 8628), only used to acquire the initial token
+struct DeviceCodeCredentials : public OAuth2Credentials {
+	static constexpr auto GRANT_TYPE = OAuth2GrantType::DEVICE_CODE;
+
+	DeviceCodeCredentials(const ClientCredentials &client_credentials, const string &device_code)
+	    : OAuth2Credentials(GRANT_TYPE), client_credentials(client_credentials), device_code(device_code) {
+	}
+
+	const ClientCredentials client_credentials;
+	const string device_code;
 };
 
 struct RefreshTokenCredentials : public OAuth2Credentials {
 	static constexpr auto GRANT_TYPE = OAuth2GrantType::REFRESH_TOKEN;
 
-	RefreshTokenCredentials(const ClientCredentials &client_credentials, const string &refresh_token)
-	    : OAuth2Credentials(GRANT_TYPE), client_credentials(client_credentials), refresh_token(refresh_token) {
+	RefreshTokenCredentials(const ClientCredentials &client_credentials, const string &refresh_token,
+	                        bool user_delegated = false)
+	    : OAuth2Credentials(GRANT_TYPE), client_credentials(client_credentials), refresh_token(refresh_token),
+	      user_delegated(user_delegated) {
 	}
 
 	//! Required client authentication for the supported refresh-token flow.
 	const ClientCredentials client_credentials;
 	const string refresh_token;
+	//! The token was issued to a user, so a failed refresh must not fall back to client credentials
+	const bool user_delegated;
 };
 
 class OAuth2Authorization : public IcebergAuthorization {

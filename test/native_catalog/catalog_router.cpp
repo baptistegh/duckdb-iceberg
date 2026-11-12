@@ -32,7 +32,11 @@ Reply Catalog::Route(const string &method, const string &path, const Json &body)
 				reply.headers.Insert(header.first, header.second.String());
 			}
 		}
-		responses[response_method + " " + response_path] = std::move(reply);
+		auto &queue = responses[response_method + " " + response_path];
+		if (!body.Has("append") || !body.At("append").Bool()) {
+			queue.clear();
+		}
+		queue.push_back(std::move(reply));
 		return {204, Json()};
 	}
 	if (path == "/__test/response" && method == "DELETE") {
@@ -41,7 +45,12 @@ Reply Catalog::Route(const string &method, const string &path, const Json &body)
 	}
 	auto response = responses.find(method + " " + path);
 	if (response != responses.end()) {
-		return response->second;
+		auto &queue = response->second;
+		auto reply = queue.front();
+		if (queue.size() > 1) {
+			queue.erase(queue.begin());
+		}
+		return reply;
 	}
 	auto query_start = path.find('?');
 	auto parts = StringUtil::Split(path.substr(1, query_start == string::npos ? string::npos : query_start - 1), '/');

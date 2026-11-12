@@ -25,6 +25,9 @@ static const IcebergOption OPTIONS[] = {
     {"oauth2_server_uri", "oauth2-server-uri", true, true, IcebergAuthorizationType::OAUTH2},
     {"oauth2_scope", "scope", true, true, IcebergAuthorizationType::OAUTH2},
     {"oauth2_grant_type", "oauth2_grant_type", true, true, IcebergAuthorizationType::OAUTH2},
+    // The user is sent to this endpoint to sign in, so a remote catalog may not choose it.
+    {"oauth2_device_authorization_uri", "oauth2_device_authorization_uri", true, false,
+     IcebergAuthorizationType::OAUTH2},
     {"client_id", "client_id", true, true, IcebergAuthorizationType::OAUTH2},
     {"client_secret", "client_secret", true, true, IcebergAuthorizationType::OAUTH2},
     {"token", "token", true, true, IcebergAuthorizationType::OAUTH2},

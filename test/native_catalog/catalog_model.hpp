@@ -49,7 +49,8 @@ private:
 	map<Identifier, Json> tables;
 	map<string, std::pair<Identifier, Json>> staged;
 	//! Exact, test-supplied responses for exercising client protocol handling.
-	map<string, Reply> responses;
+	//! Queued replies are served in order; the last one repeats.
+	map<string, vector<Reply>> responses;
 };
 
 Namespace ParseNamespace(const Json &value);

@@ -172,7 +172,9 @@ Client protocol tests can install an exact response with
 and `body`, plus an optional `headers` object. The path includes the query string.
 The response replaces that route until overwritten or cleared with
 `DELETE /__test/response`, which clears all
-scripted responses. This permits config and auth tests without external servers;
+scripted responses. With `"append": true` the response is queued after the
+route's existing responses instead; queued responses are served in order and the
+last one repeats. This permits config and auth tests without external servers;
 the normal catalog model handles all other routes.
 
 Supported behavior and exclusions follow the

@@ -1,0 +1,225 @@
+# name: test/sql/local/native_catalog/oauth2_device_code.test
+# description: OAuth2 device authorization grant (RFC 8628) for public and confidential clients
+# group: [native_catalog]
+
+require-env CATALOG_TEST_CONFIG_SETUP mock
+
+include test/sql/init_requires
+
+require json
+
+statement ok
+CREATE MACRO scripted_response(route_method, route_path, route_status, route_body, append_response) AS TABLE
+SELECT status FROM iceberg_test_catalog_request('POST', '/__test/response',
+	json_object('method', route_method, 'path', route_path, 'status', route_status, 'body', route_body::JSON,
+		'append', append_response)::VARCHAR);
+
+statement ok
+CREATE MACRO device_response(poll_interval) AS TABLE
+SELECT * FROM scripted_response('POST', '/device', 200,
+	json_object('device_code', 'the-device-code', 'user_code', 'WDJB-MJHT',
+		'verification_uri', 'https://idp.example/device', 'expires_in', 600, 'interval', poll_interval), false);
+
+statement ok
+CALL enable_logging(level := 'debug');
+
+statement ok
+SET redact_http_logs = false;
+
+# Required options are validated before contacting the authorization server.
+statement error
+CREATE SECRET missing_device_uri (TYPE ICEBERG, OAUTH2_GRANT_TYPE 'device_code', CLIENT_ID 'cli',
+	OAUTH2_SERVER_URI 'http://iceberg-mock.invalid/token');
+----
+Missing required parameter 'oauth2_device_authorization_uri'
+
+statement error
+CREATE SECRET missing_client_id (TYPE ICEBERG, OAUTH2_GRANT_TYPE 'device_code',
+	OAUTH2_DEVICE_AUTHORIZATION_URI 'http://iceberg-mock.invalid/device',
+	OAUTH2_SERVER_URI 'http://iceberg-mock.invalid/token');
+----
+Missing required parameter 'client_id'
+
+# A public client polls while authorization is pending, then stores the issued tokens.
+query I
+SELECT * FROM device_response(0);
+----
+204
+
+query I
+SELECT * FROM scripted_response('POST', '/token', 400, '{"error":"authorization_pending"}', false);
+----
+204
+
+query I
+SELECT * FROM scripted_response('POST', '/token', 200,
+	'{"access_token":"user-token","token_type":"bearer","expires_in":3600,"refresh_token":"user-refresh"}', true);
+----
+204
+
+statement ok
+CALL truncate_duckdb_logs();
+
+statement ok
+CREATE SECRET device_secret (TYPE ICEBERG, OAUTH2_GRANT_TYPE 'urn:ietf:params:oauth:grant-type:device_code',
+	CLIENT_ID 'cli', OAUTH2_SCOPE 'catalog offline_access',
+	OAUTH2_DEVICE_AUTHORIZATION_URI 'http://iceberg-mock.invalid/device',
+	OAUTH2_SERVER_URI 'http://iceberg-mock.invalid/token');
+
+query I
+SELECT request.url FROM duckdb_logs_parsed('HTTP') ORDER BY timestamp;
+----
+http://iceberg-mock.invalid/device
+http://iceberg-mock.invalid/token
+http://iceberg-mock.invalid/token
+
+# The user is told where to sign in and which code to confirm.
+query I
+SELECT count(*) FROM duckdb_logs WHERE type = 'Iceberg'
+	AND message = 'To authorize DuckDB, open https://idp.example/device and enter the code: WDJB-MJHT';
+----
+1
+
+# The grant type is normalized, and the issued tokens are kept for ATTACH.
+query II
+SELECT secret_string LIKE '%oauth2_grant_type=device_code%', secret_string LIKE '%refresh_token=redacted%'
+FROM duckdb_secrets() WHERE name = 'device_secret';
+----
+true	true
+
+# Without a refresh token the token cannot be renewed, which is reported as a warning.
+query I
+SELECT * FROM device_response(0);
+----
+204
+
+query I
+SELECT * FROM scripted_response('POST', '/token', 200, '{"access_token":"short-token","token_type":"bearer"}', false);
+----
+204
+
+statement ok
+SET warnings_as_errors = true;
+
+statement error
+CREATE SECRET no_refresh_secret (TYPE ICEBERG, OAUTH2_GRANT_TYPE 'device_code', CLIENT_ID 'cli',
+	OAUTH2_DEVICE_AUTHORIZATION_URI 'http://iceberg-mock.invalid/device',
+	OAUTH2_SERVER_URI 'http://iceberg-mock.invalid/token');
+----
+add 'offline_access' to OAUTH2_SCOPE
+
+# Having asked for offline access, the user is not told to ask for it again.
+statement error
+CREATE SECRET no_refresh_secret (TYPE ICEBERG, OAUTH2_GRANT_TYPE 'device_code', CLIENT_ID 'cli',
+	OAUTH2_SCOPE 'catalog offline_access',
+	OAUTH2_DEVICE_AUTHORIZATION_URI 'http://iceberg-mock.invalid/device',
+	OAUTH2_SERVER_URI 'http://iceberg-mock.invalid/token');
+----
+<REGEX>:[^;]*no refresh token[^;]*
+
+statement ok
+RESET warnings_as_errors;
+
+# The authorization server reports that the user denied the request.
+query I
+SELECT * FROM device_response(0);
+----
+204
+
+query I
+SELECT * FROM scripted_response('POST', '/token', 400,
+	'{"error":"access_denied","error_description":"The user denied the request"}', false);
+----
+204
+
+statement error
+CREATE SECRET denied_secret (TYPE ICEBERG, OAUTH2_GRANT_TYPE 'device_code', CLIENT_ID 'cli',
+	OAUTH2_DEVICE_AUTHORIZATION_URI 'http://iceberg-mock.invalid/device',
+	OAUTH2_SERVER_URI 'http://iceberg-mock.invalid/token');
+----
+access_denied - The user denied the request
+
+# The device code expired before the user approved it.
+query I
+SELECT * FROM scripted_response('POST', '/token', 400, '{"error":"expired_token"}', false);
+----
+204
+
+statement error
+CREATE SECRET expired_secret (TYPE ICEBERG, OAUTH2_GRANT_TYPE 'device_code', CLIENT_ID 'cli',
+	OAUTH2_DEVICE_AUTHORIZATION_URI 'http://iceberg-mock.invalid/device',
+	OAUTH2_SERVER_URI 'http://iceberg-mock.invalid/token');
+----
+expired_token
+
+# The device authorization endpoint rejects the client.
+query I
+SELECT * FROM scripted_response('POST', '/device', 401, '{"error":"invalid_client"}', false);
+----
+204
+
+statement error
+CREATE SECRET invalid_client_secret (TYPE ICEBERG, OAUTH2_GRANT_TYPE 'device_code', CLIENT_ID 'unknown',
+	OAUTH2_DEVICE_AUTHORIZATION_URI 'http://iceberg-mock.invalid/device',
+	OAUTH2_SERVER_URI 'http://iceberg-mock.invalid/token');
+----
+invalid_client
+
+# The device authorization response must include the user code.
+query I
+SELECT * FROM scripted_response('POST', '/device', 200,
+	'{"device_code":"the-device-code","verification_uri":"https://idp.example/device","expires_in":600}', false);
+----
+204
+
+statement error
+CREATE SECRET malformed_secret (TYPE ICEBERG, OAUTH2_GRANT_TYPE 'device_code', CLIENT_ID 'cli',
+	OAUTH2_DEVICE_AUTHORIZATION_URI 'http://iceberg-mock.invalid/device',
+	OAUTH2_SERVER_URI 'http://iceberg-mock.invalid/token');
+----
+is missing 'user_code'
+
+# Token refresh for a public client sends only its client_id, and a failed refresh
+# does not fall back to client credentials.
+statement ok
+CREATE SECRET public_refresh (TYPE ICEBERG, OAUTH2_GRANT_TYPE 'device_code', CLIENT_ID 'cli',
+	TOKEN 'user-token', REFRESH_TOKEN 'user-refresh', EXPIRES_IN 3600,
+	OAUTH2_SERVER_URI 'http://iceberg-mock.invalid/token');
+
+query I
+SELECT * FROM scripted_response('GET', '/v1/config', 200, '{"defaults":{"default_schema":"default"},"overrides":{}}', false);
+----
+204
+
+query I
+SELECT * FROM scripted_response('GET', '/v1/namespaces/default', 200, '{"namespace":["default"],"properties":{}}', false);
+----
+204
+
+statement ok
+ATTACH '' AS device_lake (TYPE ICEBERG, URI 'http://iceberg-mock.invalid', SECRET public_refresh);
+
+query I
+SELECT * FROM scripted_response('POST', '/token', 400, '{"error":"invalid_grant"}', false);
+----
+204
+
+statement ok
+CALL truncate_duckdb_logs();
+
+statement ok
+SET iceberg_test_force_token_expiry = true;
+
+statement error
+CREATE SCHEMA device_lake.refresh_probe;
+----
+create the secret again to re-authorize
+
+statement ok
+RESET iceberg_test_force_token_expiry;
+
+# Only the refresh-token grant was attempted.
+query I
+SELECT count(*) FROM duckdb_logs_parsed('HTTP') WHERE request.url LIKE '%/token';
+----
+1

@@ -7,6 +7,8 @@
 #include "duckdb/common/types/value.hpp"
 #include "duckdb/common/json_document.hpp"
 #include "duckdb/main/config.hpp"
+#include "duckdb/common/algorithm.hpp"
+#include "duckdb/common/printer.hpp"
 
 #include "iceberg_extension.hpp"
 #include "common/iceberg_utils.hpp"
@@ -16,8 +18,10 @@
 
 #include "rest_catalog/objects/oauth_token_response.hpp"
 #include "rest_catalog/objects/oauth_error.hpp"
+#include "rest_catalog/objects/json_utils.hpp"
 
 #include <chrono>
+#include <thread>
 
 namespace duckdb {
 
@@ -37,8 +41,15 @@ static const case_insensitive_map_t<LogicalType> &IcebergSecretOptions() {
 	    {"oauth2_scope", LogicalType::VARCHAR},
 	    {"oauth2_server_uri", LogicalType::VARCHAR},
 	    {"oauth2_grant_type", LogicalType::VARCHAR},
+	    {"oauth2_device_authorization_uri", LogicalType::VARCHAR},
 	    {"extra_http_headers", LogicalType::MAP(LogicalType::VARCHAR, LogicalType::VARCHAR)}};
 	return options;
+}
+
+static constexpr const char *DEVICE_CODE_GRANT_TYPE = "urn:ietf:params:oauth:grant-type:device_code";
+
+static bool IsDeviceCodeGrant(const string &grant_type) {
+	return StringUtil::CIEquals(grant_type, "device_code") || StringUtil::CIEquals(grant_type, DEVICE_CODE_GRANT_TYPE);
 }
 
 } // namespace
@@ -78,22 +89,33 @@ static unique_ptr<OAuth2Credentials> ExtractOAuth2CredentialsFromSecret(const Ke
 	unordered_map<string, string> extra_http_headers;
 	IcebergAuthorization::ParseExtraHttpHeaders(secret.TryGetValue("extra_http_headers"), extra_http_headers);
 
+	auto grant_type = secret.TryGetValue("oauth2_grant_type");
+	// Device-code clients are usually public clients without a secret.
+	const bool device_code = !grant_type.IsNull() && IsDeviceCodeGrant(grant_type.ToString());
+
 	auto client_id = secret.TryGetValue("client_id");
 	auto client_secret = secret.TryGetValue("client_secret");
 	unique_ptr<ClientCredentials> client;
-	if (!client_id.IsNull() && !client_secret.IsNull()) {
-		client = make_uniq<ClientCredentials>(client_id.ToString(), client_secret.ToString());
+	if (!client_id.IsNull() && (device_code || !client_secret.IsNull())) {
+		client = make_uniq<ClientCredentials>(client_id.ToString(),
+		                                      client_secret.IsNull() ? string() : client_secret.ToString());
 	}
 	auto refresh_token = secret.TryGetValue("refresh_token");
 	if (!refresh_token.IsNull()) {
 		if (!client) {
+			if (device_code) {
+				throw InvalidInputException("Device-code refresh-token credentials require 'client_id'");
+			}
 			throw InvalidInputException("Refresh-token credentials require both 'client_id' and 'client_secret'");
 		}
-		auto refresh_credentials = make_uniq<RefreshTokenCredentials>(*client, refresh_token.ToString());
+		auto refresh_credentials = make_uniq<RefreshTokenCredentials>(*client, refresh_token.ToString(), device_code);
 		refresh_credentials->extra_http_headers = extra_http_headers;
 		return std::move(refresh_credentials);
 	}
-	auto grant_type = secret.TryGetValue("oauth2_grant_type");
+	if (device_code) {
+		// Without a refresh token there is no non-interactive way to renew the token.
+		return nullptr;
+	}
 	if (!grant_type.IsNull() && !grant_type.ToString().empty() &&
 	    !StringUtil::CIEquals(grant_type.ToString(), "client_credentials")) {
 		throw InvalidInputException("Unsupported OAuth2 grant type '%s'", grant_type.ToString());
@@ -110,24 +132,97 @@ static const ClientCredentials &GetClientCredentials(const OAuth2Credentials &cr
 		return credentials.Cast<ClientCredentials>();
 	case OAuth2GrantType::REFRESH_TOKEN:
 		return credentials.Cast<RefreshTokenCredentials>().client_credentials;
+	case OAuth2GrantType::DEVICE_CODE:
+		return credentials.Cast<DeviceCodeCredentials>().client_credentials;
 	default:
 		throw InternalException("Unsupported OAuth2 credentials grant type");
 	}
 }
 
-//! Helper function to fetch OAuth2 token and parse full response (RFC 6749).
-//! Relies on DuckDB's built-in HTTP retry infrastructure (RunRequestWithRetry) for transient errors.
-static rest_api_objects::OAuthTokenResponse FetchOAuth2TokenResponse(ClientContext &context,
-                                                                     const OAuth2Credentials &credentials,
-                                                                     const string &uri, const string &scope) {
-	vector<string> parameters;
+static bool IsUserDelegated(const OAuth2Credentials &credentials) {
+	switch (credentials.grant_type) {
+	case OAuth2GrantType::REFRESH_TOKEN:
+		return credentials.Cast<RefreshTokenCredentials>().user_delegated;
+	case OAuth2GrantType::DEVICE_CODE:
+		return true;
+	default:
+		return false;
+	}
+}
+
+//! Adds client authentication to a form body; public clients only send their client_id.
+static void AddClientAuthenticationParameters(const ClientCredentials &client, vector<string> &parameters) {
+	parameters.push_back(StringUtil::Format("client_id=%s", XWWWFormUrlEncode(client.client_id)));
+	if (!client.client_secret.empty()) {
+		parameters.push_back(StringUtil::Format("client_secret=%s", XWWWFormUrlEncode(client.client_secret)));
+	}
+}
+
+static HTTPHeaders CreateFormHeaders(ClientContext &context, const unordered_map<string, string> &extra_http_headers) {
 	HTTPHeaders headers(*context.db);
 	// Forward user-supplied headers (e.g. `Polaris-Realm` for multi-tenant Polaris catalogs, see
 	// issue #978) before the service headers so the latter always take precedence.
-	for (auto &entry : credentials.extra_http_headers) {
+	for (auto &entry : extra_http_headers) {
 		headers.Insert(entry.first, entry.second);
 	}
 	headers.Insert("Content-Type", "application/x-www-form-urlencoded");
+	return headers;
+}
+
+static unique_ptr<HTTPResponse> PostForm(ClientContext &context, const string &uri, HTTPHeaders &headers,
+                                         const vector<string> &parameters) {
+	auto post_data = StringUtil::Join(parameters, "&");
+	try {
+		auto endpoint_builder = IRCEndpointBuilder::FromURL(uri);
+		return APIUtils::Request(RequestType::POST_REQUEST, context, endpoint_builder, headers, post_data);
+	} catch (std::exception &ex) {
+		// Only catch actual transport/network errors (not HTTP errors)
+		ErrorData error(ex);
+		throw InvalidConfigurationException("Could not get token from %s: %s", uri, error.RawMessage());
+	}
+}
+
+static bool IsSuccess(const HTTPResponse &response) {
+	return response.status >= HTTPStatusCode::OK_200 && response.status < HTTPStatusCode::MultipleChoices_300;
+}
+
+//! Describes a failed OAuth2 response; sets error_code when the body is an RFC 6749 Section 5.2 error.
+static string DescribeErrorResponse(const string &uri, const HTTPResponse &response, string &error_code) {
+	if (response.status >= HTTPStatusCode::BadRequest_400 &&
+	    response.status < HTTPStatusCode::InternalServerError_500) {
+		JSONParseError parse_error;
+		auto doc = JSONDocument::TryParse(response.body.c_str(), response.body.size(), parse_error);
+		if (doc) {
+			auto root = doc->GetRoot();
+			try {
+				auto oauth_error = rest_api_objects::OAuthError::FromJSON(root);
+				error_code = oauth_error._error;
+				string error_msg = StringUtil::Format("OAuth2 token request failed (%s): %s",
+				                                      EnumUtil::ToString(response.status), oauth_error._error);
+				if (oauth_error.error_description) {
+					error_msg += StringUtil::Format(" - %s", *oauth_error.error_description);
+				}
+				if (oauth_error.error_uri) {
+					error_msg += StringUtil::Format(" (see %s)", *oauth_error.error_uri);
+				}
+				return error_msg;
+			} catch (InvalidInputException &) {
+				// Not a valid OAuth error response, fall through to generic error
+			}
+		}
+		return StringUtil::Format("Could not get token from %s: HTTP %s - %s", uri, EnumUtil::ToString(response.status),
+		                          response.body);
+	}
+	return StringUtil::Format("Could not get token from %s: HTTP %s - %s", uri, EnumUtil::ToString(response.status),
+	                          response.reason);
+}
+
+//! Sends a token request (RFC 6749) without interpreting the response.
+//! Relies on DuckDB's built-in HTTP retry infrastructure (RunRequestWithRetry) for transient errors.
+static unique_ptr<HTTPResponse> SendTokenRequest(ClientContext &context, const OAuth2Credentials &credentials,
+                                                 const string &uri, const string &scope) {
+	vector<string> parameters;
+	auto headers = CreateFormHeaders(context, credentials.extra_http_headers);
 
 	switch (credentials.grant_type) {
 	case OAuth2GrantType::CLIENT_CREDENTIALS: {
@@ -144,80 +239,180 @@ static rest_api_objects::OAuthTokenResponse FetchOAuth2TokenResponse(ClientConte
 		// Google requires client authentication in the POST body for refresh-token grants.
 		parameters.push_back("grant_type=refresh_token");
 		parameters.push_back(StringUtil::Format("refresh_token=%s", XWWWFormUrlEncode(refresh.refresh_token)));
-		parameters.push_back(
-		    StringUtil::Format("client_id=%s", XWWWFormUrlEncode(refresh.client_credentials.client_id)));
-		parameters.push_back(
-		    StringUtil::Format("client_secret=%s", XWWWFormUrlEncode(refresh.client_credentials.client_secret)));
+		AddClientAuthenticationParameters(refresh.client_credentials, parameters);
 		// Omitting scope preserves the original grant's scopes.
 		if (!scope.empty()) {
 			parameters.push_back(StringUtil::Format("scope=%s", XWWWFormUrlEncode(scope)));
 		}
 		break;
 	}
+	case OAuth2GrantType::DEVICE_CODE: {
+		// RFC 8628 Section 3.4: the scope was already bound by the device authorization request.
+		auto &device = credentials.Cast<DeviceCodeCredentials>();
+		parameters.push_back(StringUtil::Format("grant_type=%s", XWWWFormUrlEncode(DEVICE_CODE_GRANT_TYPE)));
+		parameters.push_back(StringUtil::Format("device_code=%s", XWWWFormUrlEncode(device.device_code)));
+		AddClientAuthenticationParameters(device.client_credentials, parameters);
+		break;
+	}
 	default:
 		throw InternalException("Unsupported OAuth2 credentials grant type");
 	}
+	return PostForm(context, uri, headers, parameters);
+}
 
-	string post_data = StringUtil::Join(parameters, "&");
-
-	unique_ptr<HTTPResponse> response;
-	try {
-		auto endpoint_builder = IRCEndpointBuilder::FromURL(uri);
-		response = APIUtils::Request(RequestType::POST_REQUEST, context, endpoint_builder, headers, post_data);
-	} catch (std::exception &ex) {
-		// Only catch actual transport/network errors (not HTTP errors)
-		ErrorData error(ex);
-		throw InvalidConfigurationException("Could not get token from %s: %s", uri, error.RawMessage());
+//! Parses a token response. On failure returns false with the OAuth2 error code (if any) and an error message.
+static bool TryParseTokenResponse(const string &uri, const HTTPResponse &response,
+                                  rest_api_objects::OAuthTokenResponse &result, string &error_code,
+                                  string &error_message) {
+	if (!IsSuccess(response)) {
+		error_message = DescribeErrorResponse(uri, response, error_code);
+		return false;
 	}
+	JSONParseError parse_error;
+	auto doc = JSONDocument::TryParse(response.body.c_str(), response.body.size(), parse_error);
+	if (!doc) {
+		error_message = StringUtil::Format("Could not get token from %s: server returned invalid JSON", uri);
+		return false;
+	}
+	auto root = doc->GetRoot();
+	result = rest_api_objects::OAuthTokenResponse::FromJSON(root);
+	if (!StringUtil::CIEquals(result.token_type, "bearer")) {
+		throw NotImplementedException(
+		    "token_type return value '%s' is not supported, only supports 'bearer' currently.", result.token_type);
+	}
+	return true;
+}
 
-	// Check HTTP status code
-	if (response->status >= HTTPStatusCode::OK_200 && response->status < HTTPStatusCode::MultipleChoices_300) {
-		// Success: Parse OAuthTokenResponse
-		JSONParseError parse_error;
-		auto doc = JSONDocument::TryParse(response->body.c_str(), response->body.size(), parse_error);
-		if (!doc) {
-			throw InvalidConfigurationException("Could not get token from %s: server returned invalid JSON", uri);
-		}
-		auto root = doc->GetRoot();
-		auto token_response = rest_api_objects::OAuthTokenResponse::FromJSON(root);
+static rest_api_objects::OAuthTokenResponse FetchOAuth2TokenResponse(ClientContext &context,
+                                                                     const OAuth2Credentials &credentials,
+                                                                     const string &uri, const string &scope) {
+	auto response = SendTokenRequest(context, credentials, uri, scope);
+	rest_api_objects::OAuthTokenResponse result;
+	string error_code;
+	string error_message;
+	if (!TryParseTokenResponse(uri, *response, result, error_code, error_message)) {
+		throw InvalidConfigurationException(error_message);
+	}
+	return result;
+}
 
-		// Validate token_type is bearer
-		if (!StringUtil::CIEquals(token_response.token_type, "bearer")) {
-			throw NotImplementedException(
-			    "token_type return value '%s' is not supported, only supports 'bearer' currently.",
-			    token_response.token_type);
-		}
+//! Device authorization response (RFC 8628 Section 3.2)
+struct DeviceAuthorization {
+	string device_code;
+	string user_code;
+	string verification_uri;
+	string verification_uri_complete;
+	int64_t expires_in = 0;
+	int64_t interval = 5;
+};
 
-		return token_response;
-	} else if (response->status >= HTTPStatusCode::BadRequest_400 &&
-	           response->status < HTTPStatusCode::InternalServerError_500) {
-		// Client error: Try to parse OAuth2 error response (RFC 6749 Section 5.2)
-		JSONParseError parse_error;
-		auto doc = JSONDocument::TryParse(response->body.c_str(), response->body.size(), parse_error);
-		if (doc) {
-			auto root = doc->GetRoot();
-			try {
-				auto oauth_error = rest_api_objects::OAuthError::FromJSON(root);
-				string error_msg = StringUtil::Format("OAuth2 token request failed (%s): %s",
-				                                      EnumUtil::ToString(response->status), oauth_error._error);
-				if (oauth_error.error_description) {
-					error_msg += StringUtil::Format(" - %s", *oauth_error.error_description);
-				}
-				if (oauth_error.error_uri) {
-					error_msg += StringUtil::Format(" (see %s)", *oauth_error.error_uri);
-				}
-				throw InvalidConfigurationException(error_msg);
-			} catch (InvalidInputException &) {
-				// Not a valid OAuth error response, fall through to generic error
-			}
-		}
-		// Generic client error
-		throw InvalidConfigurationException("Could not get token from %s: HTTP %s - %s", uri,
-		                                    EnumUtil::ToString(response->status), response->body);
+static string GetRequiredString(JSONValue root, const char *name, const string &uri) {
+	auto value = root.GetMember(name);
+	if (!value.IsValid() || !rest_api_objects::json_utils::IsString(value)) {
+		throw InvalidConfigurationException("Device authorization response from %s is missing '%s'", uri, name);
+	}
+	return rest_api_objects::json_utils::GetString(value);
+}
+
+static DeviceAuthorization RequestDeviceAuthorization(ClientContext &context, const ClientCredentials &client,
+                                                      const unordered_map<string, string> &extra_http_headers,
+                                                      const string &uri, const string &scope) {
+	vector<string> parameters;
+	AddClientAuthenticationParameters(client, parameters);
+	if (!scope.empty()) {
+		parameters.push_back(StringUtil::Format("scope=%s", XWWWFormUrlEncode(scope)));
+	}
+	auto headers = CreateFormHeaders(context, extra_http_headers);
+	auto response = PostForm(context, uri, headers, parameters);
+	if (!IsSuccess(*response)) {
+		string error_code;
+		throw InvalidConfigurationException(DescribeErrorResponse(uri, *response, error_code));
+	}
+	JSONParseError parse_error;
+	auto doc = JSONDocument::TryParse(response->body.c_str(), response->body.size(), parse_error);
+	if (!doc) {
+		throw InvalidConfigurationException("Device authorization request to %s returned invalid JSON", uri);
+	}
+	auto root = doc->GetRoot();
+	DeviceAuthorization result;
+	result.device_code = GetRequiredString(root, "device_code", uri);
+	result.user_code = GetRequiredString(root, "user_code", uri);
+	// Google returns the non-standard 'verification_url'.
+	auto verification_url = root.GetMember("verification_url");
+	if (!root.GetMember("verification_uri").IsValid() && verification_url.IsValid()) {
+		result.verification_uri = GetRequiredString(root, "verification_url", uri);
 	} else {
-		// Server error or other status
-		throw InvalidConfigurationException("Could not get token from %s: HTTP %s - %s", uri,
-		                                    EnumUtil::ToString(response->status), response->reason);
+		result.verification_uri = GetRequiredString(root, "verification_uri", uri);
+	}
+	auto complete = root.GetMember("verification_uri_complete");
+	if (complete.IsValid() && rest_api_objects::json_utils::IsString(complete)) {
+		result.verification_uri_complete = rest_api_objects::json_utils::GetString(complete);
+	}
+	auto expires_in = root.GetMember("expires_in");
+	if (!expires_in.IsValid() || !rest_api_objects::json_utils::IsInteger(expires_in)) {
+		throw InvalidConfigurationException("Device authorization response from %s is missing 'expires_in'", uri);
+	}
+	result.expires_in = rest_api_objects::json_utils::GetSignedInteger(expires_in);
+	auto interval = root.GetMember("interval");
+	if (interval.IsValid() && rest_api_objects::json_utils::IsInteger(interval)) {
+		result.interval = MaxValue<int64_t>(rest_api_objects::json_utils::GetSignedInteger(interval), 0);
+	}
+	return result;
+}
+
+static void WaitForPollInterval(ClientContext &context, int64_t interval_seconds) {
+	auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(interval_seconds);
+	while (true) {
+		context.BlockingInterruptCheck();
+		auto now = std::chrono::steady_clock::now();
+		if (now >= deadline) {
+			return;
+		}
+		std::this_thread::sleep_for(
+		    MinValue<std::chrono::steady_clock::duration>(deadline - now, std::chrono::milliseconds(100)));
+	}
+}
+
+//! Runs the device authorization grant (RFC 8628) until the user approves, denies, or the code expires.
+static rest_api_objects::OAuthTokenResponse
+RunDeviceAuthorizationFlow(ClientContext &context, const ClientCredentials &client,
+                           const unordered_map<string, string> &extra_http_headers, const string &device_uri,
+                           const string &token_uri, const string &scope) {
+	auto authorization = RequestDeviceAuthorization(context, client, extra_http_headers, device_uri, scope);
+	auto message = authorization.verification_uri_complete.empty()
+	                   ? StringUtil::Format("To authorize DuckDB, open %s and enter the code: %s",
+	                                        authorization.verification_uri, authorization.user_code)
+	                   : StringUtil::Format("To authorize DuckDB, open %s and confirm the code: %s",
+	                                        authorization.verification_uri_complete, authorization.user_code);
+	Printer::Print(OutputStream::STREAM_STDERR, message);
+	DUCKDB_LOG(context, IcebergLogType, "%s", message);
+
+	DeviceCodeCredentials credentials(client, authorization.device_code);
+	credentials.extra_http_headers = extra_http_headers;
+	auto interval = authorization.interval;
+	auto expires_at = std::chrono::steady_clock::now() + std::chrono::seconds(authorization.expires_in);
+	while (true) {
+		WaitForPollInterval(context, interval);
+		if (std::chrono::steady_clock::now() >= expires_at) {
+			throw InvalidConfigurationException(
+			    "OAuth2 device authorization expired before it was approved; create the secret again to retry");
+		}
+		auto response = SendTokenRequest(context, credentials, token_uri, scope);
+		rest_api_objects::OAuthTokenResponse result;
+		string error_code;
+		string error_message;
+		if (TryParseTokenResponse(token_uri, *response, result, error_code, error_message)) {
+			return result;
+		}
+		if (error_code == "authorization_pending") {
+			continue;
+		}
+		if (error_code == "slow_down") {
+			// RFC 8628 Section 3.5: increase the interval by 5 seconds for this and all subsequent requests.
+			interval += 5;
+			continue;
+		}
+		throw InvalidConfigurationException(error_message);
 	}
 }
 
@@ -237,8 +432,9 @@ OAuth2Authorization::FromAttachOptions(AttachedDatabase &db, ClientContext &cont
 	string secret;
 
 	static const unordered_set<string> recognized_create_secret_options {
-	    "oauth2_scope", "oauth2_server_uri", "oauth2_grant_type", "token", "refresh_token", "expires_in",
-	    "client_id",    "client_secret",     "extra_http_headers"};
+	    "oauth2_scope",  "oauth2_server_uri", "oauth2_grant_type", "oauth2_device_authorization_uri",
+	    "token",         "refresh_token",     "expires_in",        "client_id",
+	    "client_secret", "extra_http_headers"};
 
 	for (auto &entry : input.options) {
 		auto lower_name = StringUtil::Lower(entry.first);
@@ -420,8 +616,19 @@ unique_ptr<BaseSecret> OAuth2Authorization::CreateCatalogSecretFunction(ClientCo
 		    "to fall back on. Please provide one or change the 'authorization_type'.");
 	}
 
+	auto grant_type_it = result->secret_map.find("oauth2_grant_type");
+	const bool device_code =
+	    grant_type_it != result->secret_map.end() && IsDeviceCodeGrant(grant_type_it->second.ToString());
+	if (device_code) {
+		result->secret_map["oauth2_grant_type"] = "device_code";
+	}
+
 	//! ---- Client ID + Client Secret ----
-	case_insensitive_set_t required_parameters {"client_id", "client_secret"};
+	// Device-code clients may be public clients, which have no secret.
+	case_insensitive_set_t required_parameters {"client_id"};
+	if (!device_code) {
+		required_parameters.insert("client_secret");
+	}
 	for (auto &param : required_parameters) {
 		if (!result->secret_map.count(Identifier(param))) {
 			throw InvalidInputException("Missing required parameter '%s' for authorization_type 'oauth2'", param);
@@ -440,15 +647,17 @@ unique_ptr<BaseSecret> OAuth2Authorization::CreateCatalogSecretFunction(ClientCo
 		// Per RFC 6749 Section 6, scope is optional and if omitted, is treated as equal to original scope
 		auto scope_it = result->secret_map.find("oauth2_scope");
 		scope_to_use = (scope_it != result->secret_map.end()) ? scope_it->second.ToString() : "";
+	} else if (device_code) {
+		auto scope_it = result->secret_map.find("oauth2_scope");
+		scope_to_use = (scope_it != result->secret_map.end()) ? scope_it->second.ToString() : "";
 	} else {
 		// No refresh_token - use client_credentials grant
-		auto grant_type_it = result->secret_map.find("oauth2_grant_type");
 		if (grant_type_it != result->secret_map.end()) {
 			auto grant_type_to_use = grant_type_it->second.ToString();
 			if (!StringUtil::CIEquals(grant_type_to_use, "client_credentials")) {
-				throw InvalidInputException(
-				    "Unsupported option ('%s') for 'oauth2_grant_type', only supports 'client_credentials' currently",
-				    grant_type_to_use);
+				throw InvalidInputException("Unsupported option ('%s') for 'oauth2_grant_type', only supports "
+				                            "'client_credentials' and 'device_code' currently",
+				                            grant_type_to_use);
 			}
 		}
 		// Default scope for client_credentials grant
@@ -460,8 +669,34 @@ unique_ptr<BaseSecret> OAuth2Authorization::CreateCatalogSecretFunction(ClientCo
 
 	// Make a request to the oauth2 server uri to get the (bearer) token
 	// Store the full response to capture expires_in and refresh_token
-	auto credentials = ExtractOAuth2CredentialsFromSecret(*result);
-	auto token_response = FetchOAuth2TokenResponse(context, *credentials, server_uri, scope_to_use);
+	rest_api_objects::OAuthTokenResponse token_response;
+	if (device_code && refresh_token_it == result->secret_map.end()) {
+		auto device_uri_it = result->secret_map.find("oauth2_device_authorization_uri");
+		if (device_uri_it == result->secret_map.end()) {
+			throw InvalidInputException(
+			    "Missing required parameter 'oauth2_device_authorization_uri' for oauth2_grant_type 'device_code'");
+		}
+		auto client_secret_it = result->secret_map.find("client_secret");
+		ClientCredentials client(result->secret_map["client_id"].ToString(),
+		                         client_secret_it == result->secret_map.end() ? string()
+		                                                                      : client_secret_it->second.ToString());
+		unordered_map<string, string> extra_http_headers;
+		IcebergAuthorization::ParseExtraHttpHeaders(result->TryGetValue("extra_http_headers"), extra_http_headers);
+		token_response = RunDeviceAuthorizationFlow(context, client, extra_http_headers,
+		                                            device_uri_it->second.ToString(), server_uri, scope_to_use);
+		if (!token_response.refresh_token || token_response.refresh_token->empty()) {
+			auto scopes = StringUtil::Split(scope_to_use, ' ');
+			auto requested_offline_access = std::find(scopes.begin(), scopes.end(), "offline_access") != scopes.end();
+			DUCKDB_LOG_WARNING(
+			    context,
+			    "The OAuth2 server issued no refresh token, so the token cannot be renewed once it "
+			    "expires and the secret must then be created again%s",
+			    requested_offline_access ? "" : "; if the server requires it, add 'offline_access' to OAUTH2_SCOPE");
+		}
+	} else {
+		auto credentials = ExtractOAuth2CredentialsFromSecret(*result);
+		token_response = FetchOAuth2TokenResponse(context, *credentials, server_uri, scope_to_use);
+	}
 
 	result->secret_map["token"] = token_response.access_token;
 
@@ -553,7 +788,8 @@ void OAuth2Authorization::UpdateTokenState(const string &new_token, int32_t expi
 	// to client_credentials if available. This is a known limitation.
 	if (!new_refresh_token.empty()) {
 		D_ASSERT(credentials);
-		credentials = make_uniq<RefreshTokenCredentials>(GetClientCredentials(*credentials), new_refresh_token);
+		credentials = make_uniq<RefreshTokenCredentials>(GetClientCredentials(*credentials), new_refresh_token,
+		                                                 IsUserDelegated(*credentials));
 	}
 
 	// Determine which expires_in to use
@@ -617,7 +853,15 @@ void OAuth2Authorization::RefreshAccessTokenUnlocked(ClientContext &context) {
 	}
 
 	rest_api_objects::OAuthTokenResponse token_response;
-	if (credentials->grant_type == OAuth2GrantType::REFRESH_TOKEN) {
+	if (IsUserDelegated(*credentials)) {
+		try {
+			token_response = FetchOAuth2TokenResponse(context, *credentials, uri, scope);
+		} catch (std::exception &ex) {
+			ErrorData error(ex);
+			throw InvalidConfigurationException(
+			    "Could not refresh the OAuth2 token; create the secret again to re-authorize: %s", error.RawMessage());
+		}
+	} else if (credentials->grant_type == OAuth2GrantType::REFRESH_TOKEN) {
 		try {
 			token_response = FetchOAuth2TokenResponse(context, *credentials, uri, scope);
 		} catch (std::exception &) {
